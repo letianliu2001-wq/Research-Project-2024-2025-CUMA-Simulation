@@ -1,0 +1,199 @@
+% MIMO Uncoded BER for 64-QAM under i.i.d. Rayleigh, MMSE detection
+% Author: LT  |  Note: Supports CG iterations; built-in 64QAM Gray mapping (no toolbox required)
+clear; clc; rng(42);
+
+arraySizes  = [16 64 128 256 512 1024];   % Nt = Nr
+SNRdB       = -8:2:10;                    % Es/N0 per stream (dB)
+bitsPerSym  = 6;                          % 64-QAM
+targetBits  = 2e5;                        % Target simulated bits per SNR (adjustable)
+minErrs     = 200;                        % Minimum error bits per SNR (for statistical stability)
+useCGThresh = 256;                        % Use CG when Nt >= this threshold
+cgMaxIter   = 20;                         % Consistent with figure note: CG: it=20, tol=1e-3
+cgTol       = 1e-3;
+
+% Symbols per frame depending on array size (to avoid memory overflow)
+symPerFrameSmall = 512;   % Nt < 256
+symPerFrameLarge = 128;   % Nt >= 256 (smaller for 1024x1024 to save memory)
+
+% Results
+BER = zeros(numel(arraySizes), numel(SNRdB));
+
+% -------------------- Main Loop --------------------
+for ai = 1:numel(arraySizes)
+    Nt = arraySizes(ai);  Nr = Nt;
+    useCG = (Nt >= useCGThresh);
+if useCG
+    symPerFrame = symPerFrameLarge;
+else
+    symPerFrame = symPerFrameSmall;
+end
+
+    fprintf('== Nt=Nr=%d | useCG=%d | syms/frame=%d ==\n', Nt, useCG, symPerFrame);
+
+    for si = 1:numel(SNRdB)
+        EsN0dB = SNRdB(si);
+        EsN0   = 10.^(EsN0dB/10);
+        noiseVar = 1 ./ (Nt .* EsN0);   % instead of 1./EsN0
+        
+        errCnt = 0; bitCnt = 0;
+
+        while (bitCnt < targetBits) || (errCnt < minErrs)
+            % -------- Transmit bits & mapping (64QAM Gray + unit avg power) --------
+            txBits = randi([0 1], Nt*bitsPerSym*symPerFrame, 1, 'int8'); % column vector
+            % Built-in 64QAM Gray mapper (no toolbox)
+            txSyms = qam64_gray_mod(txBits);            % length = Nt*symPerFrame
+            txSyms = reshape(txSyms, Nt, symPerFrame);
+
+            % Normalize total power to 1: each stream power = 1
+            X = txSyms / sqrt(Nt);                      % Nt x T
+
+            % -------- Channel & noise --------
+            H = (randn(Nr,Nt)+1i*randn(Nr,Nt))/sqrt(2); % CN(0,1)
+            N = sqrt(noiseVar/2) * (randn(Nr,symPerFrame)+1i*randn(Nr,symPerFrame));
+
+            Y = H*X + N;
+
+            % -------- MMSE detection (direct or CG) --------
+            % Solve (H^H H + noiseVar I)x = H^H y
+            if ~useCG
+                A = (H'*H) + noiseVar*eye(Nt);
+                B = H'*Y; % Nt x T
+                Xhat = A \ B;  % Nt x T
+            else
+                % CG solves column by column, avoids explicit inversion
+                Xhat = zeros(Nt, symPerFrame);
+                Aop  = @(v) H'*(H*v) + noiseVar*v;
+                for t = 1:symPerFrame
+                    b = H'*Y(:,t);
+                    Xhat(:,t) = cg_solve(Aop, b, cgMaxIter, cgTol);
+                end
+            end
+
+            % Undo normalization (Tx divided by sqrt(Nt))
+            Shat = Xhat * sqrt(Nt); % approximate 64QAM constellation
+
+            % -------- 64QAM Gray hard decision & error counting --------
+            rxBits = qam64_gray_demod(Shat(:));  % column vector output
+            errCnt = errCnt + sum(rxBits ~= txBits);
+            bitCnt = bitCnt + numel(txBits);
+
+            % Safety exit (prevent too long runtime)
+            if bitCnt >= 1e7, break; end
+        end
+
+        BER(ai, si) = double(errCnt) / double(bitCnt);
+        fprintf('Nt=Nr=%4d | SNR=%4.1f dB | BER=%.3e | bits=%d | errs=%d\n', ...
+                Nt, EsN0dB, BER(ai,si), bitCnt, errCnt);
+    end
+end
+
+% -------------------- Plot --------------------
+figure; hold on; grid on; box on;
+for ai = 1:numel(arraySizes)
+    semilogy(SNRdB, BER(ai,:), '-o', 'LineWidth', 1.2, 'MarkerSize', 5);
+end
+xlabel('Es/N0 per stream (dB)');
+ylabel('BER');
+title('Uncoded MIMO | 64-QAM | i.i.d. Rayleigh | MMSE (CG: it=20, tol=1e-3)');
+legend(arrayfun(@(n) sprintf('N_t=N_r=%d', n), arraySizes, 'UniformOutput', false), ...
+       'Location','southwest');
+ylim([1e-4 1]); xlim([min(SNRdB) max(SNRdB)]);
+drawnow;
+
+% -------------------- Save --------------------
+save('ber_64qam_mimo_mmse.mat', 'arraySizes', 'SNRdB', 'BER');
+
+% ==================== Function Section ====================
+
+% 64-QAM Gray mapping (no toolbox), unit average power
+function s = qam64_gray_mod(bits)
+    % bits: column vector, length multiple of 6
+    bps = 6; assert(mod(numel(bits), bps)==0, 'bits length must be multiple of 6');
+    bits = reshape(bits, bps, []).';
+    bI = bits(:,1:3); bQ = bits(:,4:6);
+
+    % 8-PAM Gray mapping table (3 bits -> level)
+    levels = [-7 -5 -3 -1 1 3 5 7];
+    gray8  = [0 0 0;
+              0 0 1;
+              0 1 1;
+              0 1 0;
+              1 1 0;
+              1 1 1;
+              1 0 1;
+              1 0 0];
+    idxI = bits2index(bI, gray8); % 1..8
+    idxQ = bits2index(bQ, gray8); % 1..8
+
+    I = levels(idxI).';  
+    Q = levels(idxQ).';
+    s = (I + 1i*Q) / sqrt(42); % unit average power (2*E[PAM8^2]=42)
+end
+
+% 64-QAM Gray hard decision (no toolbox), outputs bit column vector
+function bits = qam64_gray_demod(s)
+    s = s(:);
+    s = s * sqrt(42); % back to unnormalized I/Q plane
+    I = real(s); Q = imag(s);
+
+    levels = [-7 -5 -3 -1 1 3 5 7];
+    gray8  = [0 0 0;
+              0 0 1;
+              0 1 1;
+              0 1 0;
+              1 1 0;
+              1 1 1;
+              1 0 1;
+              1 0 0];
+
+    % Nearest neighbor decision
+    idxI = nearest_level_index(I, levels);
+    idxQ = nearest_level_index(Q, levels);
+
+    bI = gray8(idxI, :);
+    bQ = gray8(idxQ, :);
+
+    bits = [bI bQ].';
+    bits = bits(:);
+    bits = int8(bits);
+end
+
+% Convert 3-bit sequences to index (1..8) using Gray table
+function idx = bits2index(b3, tableBits)
+    N = size(b3,1);
+    idx = zeros(N,1);
+    keys = string(tableBits(:,1)) + string(tableBits(:,2)) + string(tableBits(:,3));
+    for n=1:N
+        k = string(b3(n,1)) + string(b3(n,2)) + string(b3(n,3));
+        idx(n) = find(keys==k, 1, 'first');
+    end
+end
+
+% Nearest-neighbor quantization to levels
+function idx = nearest_level_index(x, levels)
+    x = x(:);
+    L = levels(:).';
+    [~, idx] = min(abs(x - L), [], 2);
+end
+
+% Conjugate Gradient solver for A x = b, A Hermitian PD; Aop is function handle: Aop(v)=A*v
+function x = cg_solve(Aop, b, maxIter, tol)
+    x = zeros(size(b));
+    r = b - Aop(x);
+    p = r;
+    rsold = real(r'*r);
+    rs0   = rsold;
+    if rsold < eps, return; end
+    for it = 1:maxIter
+        Ap = Aop(p);
+        alpha = rsold / real(p'*Ap);
+        x = x + alpha * p;
+        r = r - alpha * Ap;
+        rsnew = real(r'*r);
+        if sqrt(rsnew) <= tol*sqrt(rs0)
+            break;
+        end
+        p = r + (rsnew/rsold)*p;
+        rsold = rsnew;
+    end
+end
