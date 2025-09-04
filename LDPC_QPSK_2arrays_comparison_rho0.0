@@ -1,0 +1,297 @@
+% ===== CUMA | QPSK + LDPC (N=512,K=256) | BER vs SNR | 32x32 & 40x40 =====
+% Channel: 2D Kronecker exponential spatial corr + AR(1) temporal corr
+% Detector: Linear MMSE via MATLAB pcg() + diagonal preconditioner
+% LDPC: custom small code (Hldpc=[P I]) + normalized min-sum BP (no toolbox)
+% Curves: Uncoded & Coded for two arrays (32x32, 40x40)
+% -------------------------------------------------------------------------------
+clear; clc; rng(7);
+
+%% ---------------- Speed/accuracy dials ----------------
+QUICK = false;            % true: faster; false: more stable
+if QUICK
+    SNRdB      = 0:3:9;      % fewer SNR points
+    cwPerSNR   = 3;          % codewords per SNR (increase for smoother curves)
+    cgTol      = 1e-2;       % PCG tolerance (tighter is more accurate but slower)
+    cgMaxIter  = 30;         % PCG max iterations
+    maxIterLDPC= 15;         % LDPC iterations
+else
+    SNRdB      = -6:3:9;
+    cwPerSNR   = 10;
+    cgTol      = 5e-3;
+    cgMaxIter  = 60;
+    maxIterLDPC= 25;
+end
+EsN0 = 10.^(SNRdB/10);
+
+%% ---------------- Arrays / modulation ----------------
+cases = [32 32; 40 40];        % only 32x32 and 40x40
+bps   = 2;                      % QPSK bits/symbol
+
+%% ---------------- Spatial correlation (separable 2D) ----------------
+rho_tx_x = 0.0; rho_tx_y = 0.0;
+rho_rx_x = 0.0; rho_rx_y = 0.0;
+
+%% ---------------- Temporal correlation (AR(1)) ----------------
+Ts = 2e-4; fD = 100;                % example: fD=100 Hz, Ts=0.2 ms
+alpha = besselj(0, 2*pi*fD*Ts);     % alpha = J0(2π fD Ts)
+
+%% ---------------- Small LDPC code (N=512, K=256) ----------------
+Kcw = 256; Ncw = 512; Mcw = Ncw - Kcw;
+P_deg = 3;                                % number of ones per column in P (sparse)
+[P, Hldpc, varEdges, chkEdges, edgeVar, edgeChk] = build_ldpc_small(Ncw, Kcw, P_deg);
+alpha_minsum = 0.8;                       % normalized min-sum scaling
+Tsym = Ncw/2;                             % QPSK: N/2 symbols per codeword
+assert(length(chkEdges)==size(Hldpc,1) && length(varEdges)==size(Hldpc,2), ...
+    'LDPC graph size mismatch.');
+
+%% ---------------- Results ----------------
+BER_coded   = zeros(size(cases,1), numel(SNRdB));
+BER_uncoded = zeros(size(cases,1), numel(SNRdB));
+
+for ci = 1:size(cases,1)
+    Nx = cases(ci,1); Ny = cases(ci,2);
+    Nt = Nx*Ny; Nr = Nt;
+
+    % 1D corr square-roots (Tx/Rx; x/y)
+    Rtx_x_sqrt = corr1d_sqrt(Nx, rho_tx_x);
+    Rtx_y_sqrt = corr1d_sqrt(Ny, rho_tx_y);
+    Rrx_x_sqrt = corr1d_sqrt(Nx, rho_rx_x);
+    Rrx_y_sqrt = corr1d_sqrt(Ny, rho_rx_y);
+
+    % Initialize correlated & temporally evolving channel
+    W0 = (randn(Nr,Nt)+1i*randn(Nr,Nt))/sqrt(2);
+    H_prev = apply_2d_corr(W0, Nx, Ny, Rtx_x_sqrt, Rtx_y_sqrt, Nx, Ny, Rrx_x_sqrt, Rrx_y_sqrt);
+
+    fprintf('== CUMA %dx%d (Nt=%d) | QPSK + LDPC small | alpha=%.4f ==\n', Nx,Ny,Nt,alpha);
+
+    for si = 1:numel(SNRdB)
+        noiseVar = 1 ./ (Nt .* EsN0(si));  % per-stream Es/N0 fairness (fixed total power)
+        err_c = 0; bits_c = 0;
+        err_u = 0; bits_u = 0;
+
+        for cw = 1:cwPerSNR
+            % ---- Update one time-correlated channel snapshot ----
+            W  = (randn(Nr,Nt)+1i*randn(Nr,Nt))/sqrt(2);
+            Hcorr = apply_2d_corr(W, Nx, Ny, Rtx_x_sqrt, Rtx_y_sqrt, Nx, Ny, Rrx_x_sqrt, Rrx_y_sqrt);
+            Hchan = alpha*H_prev + sqrt(1-alpha^2)*Hcorr;
+            H_prev = Hchan;
+
+            % ---- Build one codeword (map onto stream 1); other Nt-1 streams are random QPSK ----
+            info = randi([0 1], Kcw, 1, 'int8');
+            parity = mod(P * double(info), 2); parity = int8(parity);
+            cwBits = [info; parity];           % Ncw x 1
+            bI = cwBits(1:2:end).';            % 1 x Tsym
+            bQ = cwBits(2:2:end).';
+
+            bitsI = randi([0 1], Nt, Tsym, 'int8');
+            bitsQ = randi([0 1], Nt, Tsym, 'int8');
+            bitsI(1,:) = bI; bitsQ(1,:) = bQ;  % place the codeword onto stream-1
+
+            % ---- QPSK mapping (Nt x Tsym), power normalization ----
+            S  = (double(1-2*bitsI) + 1i*double(1-2*bitsQ)) / sqrt(2);
+            X  = S / sqrt(Nt);                 % total-power fixed
+            Nn = sqrt(noiseVar/2) * (randn(Nr,Tsym)+1i*randn(Nr,Tsym));
+            Y  = Hchan*X + Nn;
+
+            % ---- MMSE detection: A x = b, A=H^H H + noiseVar I ----
+            Afun = @(v) Hchan'*(Hchan*v) + noiseVar*v;
+            dA   = real(diag(Hchan'*Hchan)) + noiseVar;   % diagonal preconditioner
+            M    = spdiags(dA,0,Nt,Nt);
+            Xhat = zeros(Nt, Tsym);
+            for t = 1:Tsym
+                b = Hchan' * Y(:,t);
+                [Xhat(:,t),~] = pcg(Afun, b, cgTol, cgMaxIter, M, [], zeros(Nt,1));
+            end
+            Shat = Xhat * sqrt(Nt);   % approximate transmitted S
+
+            % ---- Uncoded reference (hard decisions on all streams, compare to Tx bits) ----
+            estIu = real(Shat) < 0;   % decide 1 if negative
+            estQu = imag(Shat) < 0;
+            err_u = err_u + sum(estIu(:) ~= bitsI(:)) + sum(estQu(:) ~= bitsQ(:));
+            bits_u = bits_u + 2*Nt*Tsym;
+
+            % ---- Soft metrics & LDPC decoding for stream-1 only (BER on information bits) ----
+            z  = Shat(1,:).';                     % Tsym x 1
+            z_hard = qpsk_slicer(z);
+            g = (z_hard' * z) / max(z_hard' * z_hard, eps);  % scalar gain estimate
+            if abs(g) < 1e-8, g = 1e-8; end
+            z_eq = z / g;
+            nErr = z_eq - z_hard;
+            sigma2_eff = max(mean(abs(nErr).^2), 1e-4);
+
+            LLR_I =  2*real(z_eq) / sigma2_eff;
+            LLR_Q =  2*imag(z_eq) / sigma2_eff;
+            llr = zeros(Ncw,1); llr(1:2:end) = LLR_I; llr(2:2:end) = LLR_Q;
+
+            infoHat = ldpc_decode_minsum(llr, Hldpc, varEdges, chkEdges, edgeVar, edgeChk, ...
+                                         alpha_minsum, maxIterLDPC);
+            err_c  = err_c  + sum(infoHat ~= info);
+            bits_c = bits_c + Kcw;
+        end
+
+        BER_coded(ci,si)   = err_c / max(bits_c,1);
+        BER_uncoded(ci,si) = err_u / max(bits_u,1);
+        fprintf('Nt=%4d | SNR=%4.1f dB | coded=%.3e | uncoded=%.3e\n', ...
+                 Nt, SNRdB(si), BER_coded(ci,si), BER_uncoded(ci,si));
+    end
+end
+
+%% ---------------- Plot ----------------
+figure; hold on; grid on; box on;
+markers = {'o','s'};                      % 32x32 uses o, 40x40 uses s
+for ci=1:size(cases,1)
+    semilogy(SNRdB, BER_coded(ci,:),  '-','Marker',markers{ci}, 'LineWidth',1.6,'MarkerSize',5, ...
+        'DisplayName', sprintf('%dx%d — coded', cases(ci,1), cases(ci,2)));
+    semilogy(SNRdB, BER_uncoded(ci,:), '--','Marker',markers{ci}, 'LineWidth',1.4,'MarkerSize',5, ...
+        'DisplayName', sprintf('%dx%d — uncoded', cases(ci,1), cases(ci,2)));
+end
+xlabel('E_s/N_0 per stream (dB)'); ylabel('BER');
+legend('Location','southwest'); legend boxoff;
+title('CUMA | QPSK + LDPC (N=512,K=256) | Spatial+Temporal Correlated');
+ylim([1e-5 1]); xlim([min(SNRdB) max(SNRdB)]); drawnow;
+
+%% ================= Helper functions =================
+function R1_sqrt = corr1d_sqrt(N, rho)
+    idx = 0:N-1; r = rho .^ idx; R1 = toeplitz(r);
+    R1 = (R1+R1')/2;                           % numerical symmetrization
+    [V,D] = eig(R1); d = max(real(diag(D)), 0);% ensure PSD
+    R1_sqrt = V*diag(sqrt(d))*V';
+end
+
+function H = apply_2d_corr(W, Nx_t, Ny_t, Rtx_x, Rtx_y, Nx_r, Ny_r, Rrx_x, Rrx_y)
+% Generate H = (Rrx_y^{1/2} ⊗ Rrx_x^{1/2}) * W * (Rtx_y^{1/2} ⊗ Rtx_x^{1/2})^T
+% Avoid explicit Kronecker; use 2D per-dimension transforms (memory-friendly)
+    [Nr,Nt] = size(W);
+    assert(Nt==Nx_t*Ny_t && Nr==Nx_r*Ny_r, 'Size mismatch');
+
+    Htmp = zeros(Nr, Nt, 'like', W);
+    usePage = exist('pagemtimes','file')==2;
+    bs = 32;                         % batch rows to control peak memory
+    % Right-multiply by Tx sqrt
+    for s = 1:bs:Nr
+        e = min(s+bs-1, Nr);
+        block = W(s:e, :);
+        pages = permute(reshape(block, [], Nx_t, Ny_t), [2 3 1]); % Nx_t x Ny_t x rows
+        if usePage
+            pages = pagemtimes(Rtx_x, pages);
+            pages = pagemtimes(pages, Rtx_y.');
+        else
+            for k=1:size(pages,3)
+                pages(:,:,k) = Rtx_x * pages(:,:,k) * Rtx_y.';
+            end
+        end
+        block2 = reshape(permute(pages,[3 1 2]), size(block,1), Nt);
+        Htmp(s:e, :) = block2;
+    end
+    % Left-multiply by Rx sqrt
+    H = zeros(Nr, Nt, 'like', W);
+    HtmpT = Htmp.';
+    for s = 1:bs:Nt
+        e = min(s+bs-1, Nt);
+        block = HtmpT(s:e, :).';
+        pages = permute(reshape(block, [], Nx_r, Ny_r), [2 3 1]); % Nx_r x Ny_r x cols
+        if usePage
+            pages = pagemtimes(Rrx_x, pages);
+            pages = pagemtimes(pages, Rrx_y.');
+        else
+            for k=1:size(pages,3)
+                pages(:,:,k) = Rrx_x * pages(:,:,k) * Rrx_y.';
+            end
+        end
+        block2 = reshape(permute(pages,[3 1 2]), size(block,2), Nr);
+        H(:, s:e) = block2.';
+    end
+end
+
+function s = qpsk_slicer(z)
+    s = complex(sign(real(z)), sign(imag(z))) / sqrt(2);
+end
+
+function infoHat = ldpc_decode_minsum(llr, Hldpc, varEdges, chkEdges, edgeVar, edgeChk, alpha, maxIter)
+% Normalized min-sum: input llr (N×1, double), output infoHat (K×1, int8)
+    llr = double(llr(:));
+    H = Hldpc;                                 % M x N (logical)
+    [M, N] = size(H); %#ok<NASGU>
+    E = numel(edgeVar);                        % total number of edges
+
+    % --- initialize messages on edges (var->check) ---
+    Lq = llr(edgeVar);                         % var->check (E×1)
+    Lr = zeros(E,1);                           % check->var
+
+    for it = 1:maxIter
+        % --- check node update ---
+        for c = 1:length(chkEdges)
+            edges = chkEdges{c};
+            if isempty(edges), continue; end
+            le = Lq(edges);
+            sgn = prod(sign(le + (le==0)));    % define sign at zero
+            a = abs(le);
+            if numel(a)==1
+                min1 = a; min2 = a; idxMin = 1;
+            else
+                [min1, idxMin] = min(a);
+                a(idxMin) = inf; min2 = min(a);
+            end
+            for k = 1:numel(edges)
+                eidx = edges(k);
+                s_k  = sgn * sign(Lq(eidx) + (Lq(eidx)==0));
+                mag  = min2; if k~=idxMin, mag = min1; end
+                Lr(eidx) = alpha * s_k * mag;
+            end
+        end
+
+        % --- variable node update ---
+        % a-posteriori LLR
+        Lpost = llr;
+        for v = 1:length(varEdges)
+            es = varEdges{v};
+            if ~isempty(es)
+                Lpost(v) = llr(v) + sum(Lr(es));
+            end
+        end
+        % extrinsic messages var->check
+        for v = 1:length(varEdges)
+            es = varEdges{v};
+            if isempty(es), continue; end
+            sum_in = llr(v) + sum(Lr(es));
+            for k = 1:numel(es)
+                eidx = es(k);
+                Lq(eidx) = sum_in - Lr(eidx);
+            end
+        end
+
+        % early stopping: hard decision + syndrome check
+        hard = Lpost < 0;                 
+        if all(mod(H*hard,2)==0)
+            break;
+        end
+    end
+    infoHat = int8( (Lpost(1:size(H,2)/2) < 0) );   % first K are information bits (systematic)
+end
+
+function [P, Hldpc, varEdges, chkEdges, edgeVar, edgeChk] = build_ldpc_small(N, K, colDeg)
+% Build Hldpc=[P I], where P is (N-K)×K sparse (0/1) with exactly colDeg ones per column
+    M = N - K;
+    P = spalloc(M, K, colDeg*K);
+    for j = 1:K
+        rows = randperm(M, colDeg);
+        P(rows, j) = 1;
+    end
+    Hldpc = [P, speye(M)];           % M x N
+    Hldpc = logical(Hldpc);
+
+    % Build Tanner graph adjacency lists and edge mappings
+    E = nnz(Hldpc);
+    varEdges = cell(N,1);  chkEdges = cell(M,1);
+    edgeVar  = zeros(E,1); edgeChk  = zeros(E,1);
+    e = 0;
+    for c=1:M
+        cols = find(Hldpc(c,:));
+        for v = cols
+            e = e + 1;
+            edgeVar(e) = v; edgeChk(e) = c;
+            varEdges{v}(end+1) = e; %#ok<AGROW>
+            chkEdges{c}(end+1)  = e; %#ok<AGROW>
+        end
+    end
+end
