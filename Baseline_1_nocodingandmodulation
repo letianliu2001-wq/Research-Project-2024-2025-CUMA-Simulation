@@ -1,0 +1,156 @@
+% Uncoded MIMO BER | i.i.d. Rayleigh | QPSK | MMSE via Conjugate-Gradient
+% Compare Nt=Nr in {16, 64, 128, 256, 512, 1024} on ONE figure
+clear; clc; rng(2025);
+
+%% ==== Global settings (same for all sizes) ====
+sizes   = [16 64 128 256 512 1024];   % Nt = Nr
+EsN0dB  = -8:4:12;                     % SNR grid (per-stream Es/N0)
+frames  = 20;                           % frames per SNR (light for 1024)
+Sps     = 50;                          % symbols per stream per frame (light)
+M       = 4;  k = log2(M);             % QPSK
+
+% Conjugate-Gradient (MMSE) parameters
+maxIt   = 20;                          % CG iterations
+tol     = 1e-3;                        % CG tolerance
+
+verbose = true;                        % print progress
+
+%% ==== Storage ====
+BER = zeros(numel(sizes), numel(EsN0dB));
+
+%% ==== Main loops ====
+for si = 1:numel(sizes)
+    Nt = sizes(si); Nr = sizes(si);
+    if verbose, fprintf('\n=== Array Nt=Nr=%d ===\n', Nt); end
+
+    for ei = 1:numel(EsN0dB)
+        EsN0   = 10^(EsN0dB(ei)/10);
+        sigma2 = 1/EsN0;                      % noise variance per Rx antenna
+
+        bit_err = 0; bit_all = 0;
+
+        for fr = 1:frames
+            % ---- Tx bits -> ints -> Gray QAM ----
+            bits = randi([0 1], Sps*k, Nt, 'uint8'); % [Sps*k x Nt]
+            ints = bits2ints(bits, k);               % [Sps x Nt]
+            x    = qam_mod_gray(ints, M);            % [Sps x Nt]
+
+            % ---- i.i.d. Rayleigh channel (quasi-static per frame) ----
+            H = (randn(Nr,Nt)+1i*randn(Nr,Nt))/sqrt(2);
+
+            % ---- Rx ----
+            n = sqrt(sigma2/2)*(randn(Sps,Nr)+1i*randn(Sps,Nr));
+            y = x*(H.') + n;                         % [Sps x Nr]
+
+            % ---- MMSE equalization via CG: (H'H + s2 I) x = H' y_t ----
+            Hh = H';
+            Ah = @(v,lam) Hh*(H*v) + lam*v;          % handle for A*v
+
+            for t = 1:Sps
+                b = Hh * (y(t,:).');                 % Nt x 1
+                xhat_t = cg_solve(@(v)Ah(v,sigma2), b, tol, maxIt);  % Nt x 1
+
+                % Hard decision for this symbol vector
+                rx_int   = qam_demod_gray(xhat_t.', M);   % 1 x Nt
+                rx_bits  = ints2bits(rx_int, k);          % k x Nt
+                tx_bits  = bits((t-1)*k + (1:k), :);      % k x Nt
+
+                % —— 关键修正：拉直后比较，兼容旧版 MATLAB（无隐式扩展/无 'all'）——
+                bit_err = bit_err + sum( reshape(rx_bits,[],1) ~= reshape(tx_bits,[],1) );
+                bit_all = bit_all + numel(tx_bits);
+            end
+
+            if verbose && mod(fr, max(1,floor(frames/2)))==0
+                fprintf('  SNR=%+3d dB | frame %d/%d\n', EsN0dB(ei), fr, frames);
+            end
+        end
+
+        BER(si, ei) = bit_err / bit_all;
+        if verbose
+            fprintf('Nt=Nr=%4d | SNR=%+3d dB | BER=%.3e\n', Nt, EsN0dB(ei), BER(si,ei));
+        end
+    end
+end
+
+%% ==== Plot ====
+figure; hold on; grid on;
+cc = lines(numel(sizes));
+for si = 1:numel(sizes)
+    semilogy(EsN0dB, BER(si,:), '-o', 'LineWidth', 1.6, 'Color', cc(si,:));
+end
+xlabel('Es/N0 per stream (dB)'); ylabel('BER');
+lg = arrayfun(@(N) sprintf('Nt=Nr=%d', N), sizes, 'UniformOutput', false);
+legend(lg{:}, 'Location', 'southwest');
+title(sprintf('Uncoded MIMO | QPSK | i.i.d. Rayleigh | MMSE (CG: it=%d, tol=%g)', maxIt, tol));
+ylim([1e-5 1]); xlim([min(EsN0dB) max(EsN0dB)]);
+
+%% ===== Helper functions =====
+function x = cg_solve(Afun, b, tol, maxit)
+    % Solve A x = b using Conjugate Gradient (for Hermitian PSD A)
+    x = zeros(size(b)); r = b - Afun(x); p = r; rs = real(r'*r);
+    for k=1:maxit
+        Ap = Afun(p); alpha = rs / real(p'*Ap);
+        x = x + alpha*p;
+        r = r - alpha*Ap;
+        rs_new = real(r'*r);
+        if rs_new < (tol^2)*rs, break; end
+        p = r + (rs_new/rs)*p;
+        rs = rs_new;
+    end
+end
+
+function ints=bits2ints(bits,k)
+    [L,C]=size(bits);
+    if mod(L,k)~=0, error('bits rows must be multiple of k'); end
+    S=L/k; bits3=reshape(uint8(bits),k,S,C);
+    w=uint32(2.^(k-1:-1:0));
+    ints=zeros(S,C,'uint32');
+    for i=1:k
+        slice=squeeze(bits3(i,:,:));
+        ints=ints+uint32(slice).*w(i);
+    end
+end
+
+function bits=ints2bits(ints,k)
+    [S,C]=size(ints); ints=uint32(ints);
+    bits3=zeros(k,S,C,'uint8');
+    for i=1:k
+        shift=k-i;
+        bits3(i,:,:) = uint8(bitand(bitshift(ints,-shift),1));
+    end
+    bits=reshape(bits3,k*S,C);
+end
+
+function x=qam_mod_gray(ints,M)
+    sM=sqrt(M); p=round(log2(sM));
+    q=bitand(ints,uint32(2^p-1)); i=bitshift(ints,-p);
+    ig=bitxor(i,bitshift(i,-1)); qg=bitxor(q,bitshift(q,-1));
+    lv=(-double(sM-1):2:double(sM-1));
+    I=lv(double(ig)+1); Q=lv(double(qg)+1);
+    Es=(2/3)*(M-1); x=(I+1i*Q)/sqrt(Es);   % unit Es per stream
+end
+
+function ints=qam_demod_gray(x,M)
+    sM=sqrt(M); p=round(log2(sM));
+    lv=(-double(sM-1):2:double(sM-1));
+    Es=(2/3)*(M-1); x=x*sqrt(Es);
+    idxI=quant(real(x),lv); idxQ=quant(imag(x),lv);
+    ig=uint32(idxI); qg=uint32(idxQ);
+    i=gray2bin(ig); q=gray2bin(qg);
+    ints=bitshift(i,p)+q;
+end
+
+function idx=quant(X,lv)
+    step=lv(2)-lv(1); base=lv(1);
+    idxf=round((X-base)/step);
+    idx=uint32(min(max(idxf,0),numel(lv)-1));
+end
+
+function y=gray2bin(g)
+    y=uint32(g); t=uint32(g);
+    while true
+        t=bitshift(t,-1);
+        if all(t(:)==0), break; end
+        y=bitxor(y,t);
+    end
+end
