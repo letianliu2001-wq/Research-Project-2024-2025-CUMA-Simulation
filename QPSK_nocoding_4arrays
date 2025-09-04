@@ -1,0 +1,320 @@
+% ===== CUMA with Spatial & Temporal Correlation: BER (QPSK by default) =====
+clear; clc; rng(7);
+
+% ------------------ CONFIG ------------------
+arraySizes = [1024 1600 2304 4096];   % Nt = Nr
+modType    = 'QPSK';                  % 'QPSK' | '16QAM' | '64QAM'
+SNRdB      = -6:2:10;                 % per-stream Es/N0 (dB)
+targetBits = 1e5;                     % Target bits per SNR (smaller for large arrays)
+minErrs    = 200;                     % Minimum error bits for statistical stability
+useCoupling= false;                   % Enable simple mutual coupling model
+c_couple   = 0.15;                    % Coupling coefficient (0~0.3)
+
+% Spatial correlation (Kronecker): exponential rho^{|i-j|}
+rho_t = 0.7;       % Tx correlation coefficient (stronger in compact CUMA)
+rho_r = 0.7;       % Rx correlation coefficient
+
+% Temporal correlation AR(1):
+Ts    = 1e-4;      % Symbol duration
+v_over_lambda = 5; % v/lambda, Doppler fD = v/lambda
+fD = v_over_lambda;
+alpha = besselj(0, 2*pi*fD*Ts); % J0(2π fD Ts)
+
+% Large-array settings: symbols per frame & detector
+symPerFrame_small = 256;
+symPerFrame_large = 64;      % For Nt>=1024, smaller frame size
+cgMaxIter = 80;              % CG iterations (more stable)
+cgTol     = 1e-4;            % CG convergence threshold
+useCG_from_N = 800;          % Use CG when Nt >= this threshold
+
+% ------------------ MODULATION ------------------
+[bitsPerSym, modFun, demodFun] = get_mod_mapper(modType);
+
+% Results
+BER = zeros(numel(arraySizes), numel(SNRdB));
+
+% ------------------ MAIN ------------------
+for ai = 1:numel(arraySizes)
+    Nt = arraySizes(ai);  Nr = Nt;
+    useCG = (Nt >= useCG_from_N);
+
+    if Nt >= 1024
+        symPerFrame = symPerFrame_large;
+    else
+        symPerFrame = symPerFrame_small;
+    end
+
+    % Precompute square roots of correlation matrices (EVD)
+    Rt_sqrt = corr_to_sqrt_toeplitz(Nt, rho_t);
+    Rr_sqrt = corr_to_sqrt_toeplitz(Nr, rho_r);
+
+    % (Optional) coupling matrices (Toeplitz, nearest neighbors)
+    if useCoupling
+        Ct = coupling_toeplitz(Nt, c_couple);
+        Cr = coupling_toeplitz(Nr, c_couple);
+    else
+        Ct = eye(Nt); Cr = eye(Nr);
+    end
+
+    % Initialize temporally correlated H (draw from stationary distribution)
+    H_prev = Rr_sqrt * ((randn(Nr,Nt)+1i*randn(Nr,Nt))/sqrt(2)) * Rt_sqrt;
+
+    fprintf('== CUMA %dx%d | mod=%s | useCG=%d | alpha=%.3f ==\n', Nt,Nr,modType,useCG,alpha);
+
+    for si = 1:numel(SNRdB)
+        EsN0dB = SNRdB(si);
+        EsN0   = 10.^(EsN0dB/10);
+
+        % Per-stream Es/N0 fairness: total power fixed, noise scaled with Nt
+        noiseVar = 1 ./ (Nt .* EsN0);
+
+        errCnt = 0; bitCnt = 0;
+
+        while (bitCnt < targetBits) || (errCnt < minErrs)
+            % ---------- Generate temporally correlated channel ----------
+            W = (randn(Nr,Nt)+1i*randn(Nr,Nt))/sqrt(2);
+            H = alpha*H_prev + sqrt(1-alpha^2) * (Rr_sqrt * W * Rt_sqrt);
+            H_prev = H; % evolve in time
+
+            % Apply coupling
+            Heff = Cr * H * Ct;
+
+            % ---------- Transmission & noise ----------
+            txBits = randi([0 1], Nt*bitsPerSym*symPerFrame, 1); % double 0/1
+            txSyms = modFun(txBits);               % column vector (unit power)
+            txSyms = reshape(txSyms, Nt, symPerFrame);
+            X = txSyms / sqrt(Nt);                 % total power fixed
+
+            N = sqrt(noiseVar/2) * (randn(Nr,symPerFrame)+1i*randn(Nr,symPerFrame));
+            Y = Heff*X + N;
+
+            % ---------- MMSE detection ----------
+            % Solve (H^H H + noiseVar I) Xhat = H^H Y
+            if ~useCG
+                A = (Heff'*Heff) + noiseVar*eye(Nt);
+                B = Heff' * Y;                % Nt x T
+                % One factorization, multiple columns solved
+                [R,p] = chol(A,'upper');
+                if p==0
+                    Xhat = R \ (R' \ B);
+                else
+                    Xhat = A \ B;
+                end
+            else
+                % CG per column (diagonal preconditioner)
+                Xhat = zeros(Nt, symPerFrame);
+                Aop  = @(v) Heff'*(Heff*v) + noiseVar*v;
+                dA = real(diag(Heff'*Heff)) + noiseVar;
+                Mdiag = 1 ./ max(dA, eps);
+                for t = 1:symPerFrame
+                    b = Heff' * Y(:,t);
+                    Xhat(:,t) = pcg_fun(Aop, b, cgTol, cgMaxIter, Mdiag);
+                end
+            end
+
+            % Undo normalization back to constellation domain
+            Shat = Xhat * sqrt(Nt);
+
+            % ---------- Decision & error statistics ----------
+            rxBits = demodFun(Shat(:));   % double 0/1
+            errCnt = errCnt + sum(rxBits ~= txBits);
+            bitCnt = bitCnt + numel(txBits);
+
+            % Safety exit to avoid excessive runtime
+            if bitCnt >= 3e6, break; end
+        end
+
+        BER(ai, si) = double(errCnt) / double(bitCnt);
+        fprintf('Nt=Nr=%4d | SNR=%4.1f dB | BER=%.3e | bits=%d | errs=%d\n', ...
+            Nt, EsN0dB, BER(ai,si), bitCnt, errCnt);
+    end
+end
+
+% ------------------ Plot ------------------
+figure; hold on; grid on; box on;
+for ai = 1:numel(arraySizes)
+    semilogy(SNRdB, BER(ai,:), '-o', 'LineWidth', 1.2, 'MarkerSize', 5);
+end
+xlabel('E_s/N_0 per stream (dB)');
+ylabel('BER');
+title(sprintf('CUMA (Kronecker Corr + AR(1)) | %s | MMSE (CG tol=%.0e)', modType, cgTol));
+legend(arrayfun(@(n) sprintf('N_t=N_r=%d', n), arraySizes, 'UniformOutput', false), 'Location','southwest');
+ylim([1e-4 1]); xlim([min(SNRdB) max(SNRdB)]);
+drawnow;
+
+% ================== FUNCTIONS ==================
+
+function Rt_sqrt = corr_to_sqrt_toeplitz(N, rho)
+% Toeplitz R(i,j)=rho^{|i-j|}, returns sqrt(R) such that R^(1/2) * W * R^(1/2) generates correlated Gaussian
+    idx = 0:N-1;
+    r   = rho .^ idx;
+    R   = toeplitz(r);
+    % Stable EVD
+    [V,D] = eig((R+R')/2); d = max(real(diag(D)), 0);
+    Rt_sqrt = V * diag(sqrt(d)) * V';
+end
+
+function C = coupling_toeplitz(N, c)
+% Simple coupling approximation: main diagonal=1, first off-diagonal=c, second off-diagonal=c^2
+    main = ones(N,1);
+    off1 = c*ones(N-1,1);
+    off2 = (c^2)*ones(N-2,1);
+    C = spdiags([off2 off1 main off1 off2], [-2 -1 0 1 2], N, N);
+    C = full(C);
+end
+
+function [bps, modFun, demodFun] = get_mod_mapper(modType)
+    switch upper(modType)
+        case 'QPSK'
+            bps = 2;
+            modFun   = @(bits) qpsk_mod(bits);
+            demodFun = @(s)    qpsk_demod(s);
+        case '16QAM'
+            bps = 4;
+            [bps, modFun, demodFun] = qam_gray_mapper(16);
+        case '64QAM'
+            bps = 6;
+            [bps, modFun, demodFun] = qam_gray_mapper(64);
+        otherwise
+            error('Unsupported modulation: %s', modType);
+    end
+end
+
+% -------- QPSK (Gray) --------
+function s = qpsk_mod(bits)
+    bits = double(bits(:));                 
+    assert(mod(numel(bits),2)==0);
+    b = reshape(bits,2,[]).';
+    I = 1 - 2*b(:,1);
+    Q = 1 - 2*b(:,2);
+    s = complex(I, Q) / sqrt(2);           % unit average power
+    s = s(:);
+end
+
+function bits = qpsk_demod(s)
+    s = s(:);
+    b1 = real(s)<0; b2 = imag(s)<0;
+    bits = double([b1 b2])';
+    bits = bits(:);
+end
+
+% -------- General Gray QAM (no toolbox) --------
+function [bps, modFun, demodFun] = qam_gray_mapper(M)
+    bps = log2(M);
+    L = sqrt(M); assert(L==round(L), 'Square QAM only.');
+    pamL = -(L-1):2:(L-1); pamL = pamL(:).';
+    m = log2(L);
+
+    modFun = @(bits) local_qam_mod(bits, bps, pamL, m);
+    demodFun = @(s)  local_qam_demod(s, bps, pamL, m);
+end
+
+function s = local_qam_mod(bits, bps, pamL, m)
+    bits = double(bits(:));
+    assert(mod(numel(bits), bps)==0);
+    k = numel(bits)/bps;
+    B = reshape(bits, bps, k).';
+
+    GI = B(:,1:m);            
+    GQ = B(:,m+1:end);        
+    BI = gray2bin_rows(GI);   
+    BQ = gray2bin_rows(GQ);
+
+    idxI = bits_to_int_rows(BI) + 1;   
+    idxQ = bits_to_int_rows(BQ) + 1;
+
+    I = pamL(idxI).';
+    Q = pamL(idxQ).';
+
+    s = complex(I, Q);
+    % Normalize to unit average power (square M-QAM: Es = 2/3 (L^2-1))
+    s = s / sqrt((2/3)*((numel(pamL)^2)-1));
+    s = s(:);
+end
+
+function bits = local_qam_demod(s, bps, pamL, m)
+    s = s(:);
+    I = real(s); Q = imag(s);
+    idxI = nearest_idx(I, pamL);  
+    idxQ = nearest_idx(Q, pamL);  
+
+    BI = int_to_bits_rows(idxI-1, m);       
+    BQ = int_to_bits_rows(idxQ-1, m);
+    GI = bin2gray_rows(BI);                 
+    GQ = bin2gray_rows(BQ);
+
+    bits = [GI GQ].';
+    bits = double(bits(:));
+end
+
+% -------- Bit helpers (no toolbox) --------
+function idx = nearest_idx(x, lev)
+    x = x(:); L = lev(:).';
+    [~, idx] = min(abs(x - L), [], 2);
+end
+
+function ints = bits_to_int_rows(B)
+% B: n x m (left-msb). Returns n x 1 integers.
+    [n,m] = size(B);
+    w = 2.^(m-1:-1:0);
+    ints = B * w.';
+end
+
+function B = int_to_bits_rows(v, m)
+% v: n x 1 integers in [0, 2^m-1], returns n x m left-msb bits (double 0/1)
+    v = double(v(:));
+    n = numel(v);
+    B = zeros(n, m);
+    for k = 1:m
+        bitpos = m - k;             
+        B(:,k) = floor(v ./ 2.^bitpos);
+        v = v - B(:,k) .* 2.^bitpos;
+    end
+end
+
+function Bout = gray2bin_rows(G)
+% Row-wise Gray->Binary: b0=g0, bk = xor(bk-1, gk)
+    G = double(G);
+    [n,m] = size(G);
+    Bout = zeros(n,m);
+    if m==0, return; end
+    Bout(:,1) = G(:,1);
+    for k = 2:m
+        Bout(:,k) = xor(Bout(:,k-1), G(:,k));
+    end
+end
+
+function Gout = bin2gray_rows(B)
+% Row-wise Binary->Gray: g0=b0, gk = xor(bk-1, bk)
+    B = double(B);
+    [n,m] = size(B);
+    Gout = zeros(n,m);
+    if m==0, return; end
+    Gout(:,1) = B(:,1);
+    for k = 2:m
+        Gout(:,k) = xor(B(:,k-1), B(:,k));
+    end
+end
+
+% -------- PCG (diagonal preconditioning) --------
+function xb = pcg_fun(Aop, b, tol, maxit, Mdiag)
+    if nargin<5 || isempty(Mdiag), Mdiag = []; end
+    x = zeros(size(b));
+    r = b - Aop(x);
+    if ~isempty(Mdiag), z = Mdiag .* r; else, z = r; end
+    p = z; rz = real(r'*z);
+    rz0 = max(rz, eps);
+    for it=1:maxit
+        Ap = Aop(p);
+        alpha = rz / max(real(p'*Ap), eps);
+        x = x + alpha*p;
+        r = r - alpha*Ap;
+        if ~isempty(Mdiag), z = Mdiag .* r; else, z = r; end
+        rz_new = real(r'*z);
+        if sqrt(max(rz_new,0)) <= tol*sqrt(rz0), break; end
+        beta = rz_new / max(rz, eps);
+        p = z + beta*p;
+        rz = rz_new;
+    end
+    xb = x;
+end
